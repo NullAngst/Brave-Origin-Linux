@@ -32,6 +32,9 @@ for c in "${release_channels[@]}"; do
   version=$(lookup "$c" "${VERSIONS:-}")
   [ -n "$version" ] || { echo "no version given for $c" >&2; exit 1; }
   name=$(cfg "$c" name)
+  label=$(cfg "$c" label)
+  # Always name the channel, including Stable, so the releases page is clear.
+  title="Brave Origin $label $version"
   slug=$(cfg "$c" slug)
   prefix=$(cfg "$c" appimage_name)
   rolling=$(cfg "$c" release_tag)
@@ -51,6 +54,8 @@ for c in "${release_channels[@]}"; do
 
   upstream=$(lookup "$c" "${UPSTREAM_TAGS:-}")
   {
+    echo "**Channel: $label**"
+    echo
     echo "$name $version, repackaged unmodified from Brave's official Linux build${upstream:+ on the [$upstream release](https://github.com/brave/brave-browser/releases/tag/$upstream)}."
     echo
     echo "Changelog: [CHANGELOG_DESKTOP_ORIGIN.md](https://github.com/brave/brave-browser/blob/master/CHANGELOG_DESKTOP_ORIGIN.md)"
@@ -76,14 +81,14 @@ for c in "${release_channels[@]}"; do
     # Replace the rolling release, and move its tag to the current commit.
     gh release delete "$tag" --cleanup-tag --yes 2>/dev/null || true
     gh release create "$tag" "$files"/*.flatpak "$files"/*.AppImage "$files"/*.zsync "$files/SHA256SUMS" \
-      --target "${GITHUB_SHA:-main}" --title "$name $version" --notes-file "$files/notes.md" \
+      --target "${GITHUB_SHA:-main}" --title "$title" --notes-file "$files/notes.md" \
       --prerelease --latest=false
   elif gh release view "$tag" >/dev/null 2>&1; then
     gh release upload "$tag" "$files"/*.flatpak "$files"/*.AppImage "$files"/*.zsync "$files/SHA256SUMS" --clobber
-    gh release edit "$tag" --title "$name $version" --notes-file "$files/notes.md" --latest
+    gh release edit "$tag" --title "$title" --notes-file "$files/notes.md" --latest
   else
     gh release create "$tag" "$files"/*.flatpak "$files"/*.AppImage "$files"/*.zsync "$files/SHA256SUMS" \
-      --target "${GITHUB_SHA:-main}" --title "$name $version" --notes-file "$files/notes.md" --latest
+      --target "${GITHUB_SHA:-main}" --title "$title" --notes-file "$files/notes.md" --latest
   fi
   rm -rf "$files"
 done

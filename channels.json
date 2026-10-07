@@ -6,7 +6,8 @@
     "appimage_name": "Brave-Origin",
     "profile_dir": "BraveSoftware/Brave-Origin",
     "icon_suffix": "",
-    "release_tag": ""
+    "release_tag": "",
+    "label": "Stable"
   },
   "beta": {
     "app_id": "com.brave.OriginBeta",
@@ -15,7 +16,8 @@
     "appimage_name": "Brave-Origin-Beta",
     "profile_dir": "BraveSoftware/Brave-Origin-Beta",
     "icon_suffix": "_beta",
-    "release_tag": "beta"
+    "release_tag": "beta",
+    "label": "Beta"
   },
   "nightly": {
     "app_id": "com.brave.OriginNightly",
@@ -24,6 +26,7 @@
     "appimage_name": "Brave-Origin-Nightly",
     "profile_dir": "BraveSoftware/Brave-Origin-Nightly",
     "icon_suffix": "_nightly",
-    "release_tag": "nightly"
+    "release_tag": "nightly",
+    "label": "Nightly"
   }
 }
