@@ -1,0 +1,224 @@
+name: Build Brave Origin
+
+on:
+  schedule:
+    # Every 6 hours. Brave ships stable updates a few times a month, so this
+    # catches them the same day without burning runner time.
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and replace the release even if this version is already released
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'appimage/**'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-brave-origin
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
+      build: ${{ steps.resolve.outputs.build }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force || 'false' }}
+        run: python3 scripts/resolve-release.py --github-output "$GITHUB_OUTPUT"
+
+  flatpak:
+    needs: check
+    # A push builds even when the version is already released, so script
+    # changes get tested. Only the release job decides what gets published.
+    if: needs.check.outputs.build == 'true' || github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.check.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder python3-yaml
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      - name: Get Flathub's com.brave.Browser manifest
+        run: git clone --depth 1 https://github.com/flathub/com.brave.Browser.git flathub-brave
+
+      - name: Generate the Origin manifest
+        env:
+          MATRIX: ${{ needs.check.outputs.matrix }}
+        run: |
+          python3 scripts/gen-flatpak-manifest.py \
+            --flathub-dir flathub-brave \
+            --out-dir flatpak \
+            --version '${{ needs.check.outputs.version }}' \
+            --matrix "$MATRIX"
+          cat flatpak/com.brave.Origin.yaml
+
+      - name: Build
+        run: |
+          flatpak-builder --user --install-deps-from=flathub --force-clean \
+            --disable-rofiles-fuse --default-branch=stable --repo=repo \
+            build flatpak/com.brave.Origin.yaml
+          # Bundles and the hosted repo are made in the publish job, where
+          # the signing key is. Here we just hand over the build repo.
+          tar -cf "flatpak-repo-${{ matrix.arch }}.tar" -C repo .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-repo-${{ matrix.arch }}
+          path: flatpak-repo-${{ matrix.arch }}.tar
+          if-no-files-found: error
+          compression-level: 0
+
+  appimage:
+    needs: check
+    if: needs.check.outputs.build == 'true' || github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.check.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libarchive-tools zsync file
+
+      - name: Build
+        run: |
+          OUT_DIR=dist bash scripts/build-appimage.sh \
+            '${{ matrix.arch }}' '${{ matrix.url }}' '${{ matrix.sha256 }}' \
+            '${{ matrix.kind }}' '${{ needs.check.outputs.version }}' '${{ github.repository }}'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage-${{ matrix.arch }}
+          path: |
+            dist/*.AppImage
+            dist/*.zsync
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    needs: [check, flatpak, appimage]
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      signed: ${{ steps.flatpak.outputs.signed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install flatpak and ostree
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak ostree
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: appimage-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: flatpak-repo-*
+          path: flatpak-repos
+          merge-multiple: true
+
+      - name: Build the Flatpak repo and bundles
+        id: flatpak
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          PAGES_URL: ${{ vars.PAGES_URL }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          if [ -n "$FLATPAK_GPG_PRIVATE_KEY" ]; then
+            export GPG_HOMEDIR="$RUNNER_TEMP/gnupg"
+            mkdir -m 700 "$GPG_HOMEDIR"
+            printf '%s\n' "$FLATPAK_GPG_PRIVATE_KEY" | gpg --homedir "$GPG_HOMEDIR" --batch --import
+            GPG_KEY_ID=$(gpg --homedir "$GPG_HOMEDIR" --list-secret-keys --with-colons | awk -F: '/^fpr/ {print $10; exit}')
+            export GPG_KEY_ID
+          else
+            echo "::warning::FLATPAK_GPG_PRIVATE_KEY is not set, so there is no hosted Flatpak repo and the bundles will not update. See the README."
+          fi
+          # Default Pages address. Set the PAGES_URL repo variable if you use a custom domain.
+          if [ -z "$PAGES_URL" ]; then
+            PAGES_URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
+          fi
+          echo "pages_url=$PAGES_URL" >> "$GITHUB_OUTPUT"
+          bash scripts/publish-flatpak-repo.sh "$VERSION" "$PAGES_URL" site dist flatpak-repos/*.tar >> "$GITHUB_OUTPUT"
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- *.flatpak *.AppImage > SHA256SUMS && cat SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.check.outputs.version }}
+          UPSTREAM_TAG: ${{ needs.check.outputs.upstream_tag }}
+          SIGNED: ${{ steps.flatpak.outputs.signed }}
+          PAGES_URL: ${{ steps.flatpak.outputs.pages_url }}
+        run: |
+          tag="v$VERSION"
+          {
+            echo "Brave Origin $VERSION, repackaged from Brave's official Linux build on the [$UPSTREAM_TAG release](https://github.com/brave/brave-browser/releases/tag/$UPSTREAM_TAG)."
+            echo
+            echo "Changelog: [CHANGELOG_DESKTOP_ORIGIN.md](https://github.com/brave/brave-browser/blob/master/CHANGELOG_DESKTOP_ORIGIN.md)"
+            echo
+            if [ "$SIGNED" = true ]; then
+              echo "Install the Flatpak with updates: \`flatpak install --user ${PAGES_URL}brave-origin.flatpakref\`"
+            else
+              echo "Install the Flatpak: \`flatpak install --user ./brave-origin-$VERSION-x86_64.flatpak\` (or aarch64)."
+            fi
+            echo
+            echo "See the README for the AppImage."
+          } > notes.md
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+            gh release edit "$tag" --notes-file notes.md --latest
+          else
+            gh release create "$tag" dist/* --title "Brave Origin $VERSION" --notes-file notes.md --latest
+          fi
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.flatpak.outputs.signed == 'true'
+        with:
+          path: site
+
+  pages:
+    needs: release
+    if: needs.release.outputs.signed == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
