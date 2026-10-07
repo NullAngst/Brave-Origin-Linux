@@ -2,20 +2,25 @@ name: Build Brave Origin
 
 on:
   schedule:
-    # Every 6 hours. Brave ships stable updates a few times a month, so this
-    # catches them the same day without burning runner time.
+    # Every 6 hours. Nightly and beta update every day or two, stable a few
+    # times a month, and each run only builds the channels that changed.
     - cron: '23 */6 * * *'
   workflow_dispatch:
     inputs:
       force:
-        description: Rebuild and replace the release even if this version is already released
+        description: Rebuild and re-release the current version of each channel
         type: boolean
         default: false
+      channels:
+        description: Only these channels, space-separated (blank means all)
+        type: string
+        default: ''
   push:
     branches: [main]
     paths:
       - 'scripts/**'
       - 'appimage/**'
+      - 'channels.json'
       - '.github/workflows/build.yml'
 
 permissions:
@@ -25,31 +30,41 @@ concurrency:
   group: build-brave-origin
   cancel-in-progress: false
 
+env:
+  # Channels served as a Flatpak repo from GitHub Pages, so `flatpak update`
+  # works for them. All three would be about 1.05 GB, over the 1 GB Pages
+  # limit, so beta only gets bundles and AppImages.
+  HOSTED_CHANNELS: stable nightly
+
 jobs:
   check:
     runs-on: ubuntu-24.04
     outputs:
-      version: ${{ steps.resolve.outputs.version }}
-      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
-      build: ${{ steps.resolve.outputs.build }}
       matrix: ${{ steps.resolve.outputs.matrix }}
+      release_channels: ${{ steps.resolve.outputs.release_channels }}
+      versions: ${{ steps.resolve.outputs.versions }}
+      upstream_tags: ${{ steps.resolve.outputs.upstream_tags }}
+      any_release: ${{ steps.resolve.outputs.any_release }}
     steps:
       - uses: actions/checkout@v4
       - id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force || 'false' }}
+          CHANNELS_FILTER: ${{ inputs.channels || '' }}
+          # A push builds every channel so script changes get tested, but
+          # only new versions get released.
+          BUILD_ALL: ${{ github.event_name == 'push' }}
         run: python3 scripts/resolve-release.py --github-output "$GITHUB_OUTPUT"
 
   flatpak:
     needs: check
-    # A push builds even when the version is already released, so script
-    # changes get tested. Only the release job decides what gets published.
-    if: needs.check.outputs.build == 'true' || github.event_name == 'push'
+    if: needs.check.outputs.matrix != '[]'
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.check.outputs.matrix) }}
+    name: flatpak (${{ matrix.channel }}, ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -63,40 +78,43 @@ jobs:
       - name: Get Flathub's com.brave.Browser manifest
         run: git clone --depth 1 https://github.com/flathub/com.brave.Browser.git flathub-brave
 
-      - name: Generate the Origin manifest
+      - name: Generate the manifest
+        id: gen
         env:
           MATRIX: ${{ needs.check.outputs.matrix }}
+          CHANNEL: ${{ matrix.channel }}
         run: |
-          python3 scripts/gen-flatpak-manifest.py \
-            --flathub-dir flathub-brave \
-            --out-dir flatpak \
-            --version '${{ needs.check.outputs.version }}' \
-            --matrix "$MATRIX"
-          cat flatpak/com.brave.Origin.yaml
+          manifest=$(python3 scripts/gen-flatpak-manifest.py --flathub-dir flathub-brave \
+            --out-dir flatpak --channel "$CHANNEL" --matrix "$MATRIX")
+          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+          cat "$manifest"
 
       - name: Build
+        env:
+          MANIFEST: ${{ steps.gen.outputs.manifest }}
+          TARBALL: flatpak-repo-${{ matrix.channel }}-${{ matrix.arch }}.tar
         run: |
           flatpak-builder --user --install-deps-from=flathub --force-clean \
-            --disable-rofiles-fuse --default-branch=stable --repo=repo \
-            build flatpak/com.brave.Origin.yaml
-          # Bundles and the hosted repo are made in the publish job, where
-          # the signing key is. Here we just hand over the build repo.
-          tar -cf "flatpak-repo-${{ matrix.arch }}.tar" -C repo .
+            --disable-rofiles-fuse --repo=repo build "$MANIFEST"
+          # Bundles and the Pages repo are made in the release job, where the
+          # signing key is. Here we just hand over the build repo.
+          tar -cf "$TARBALL" -C repo .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: flatpak-repo-${{ matrix.arch }}
-          path: flatpak-repo-${{ matrix.arch }}.tar
+          name: flatpak-repo-${{ matrix.channel }}-${{ matrix.arch }}
+          path: flatpak-repo-${{ matrix.channel }}-${{ matrix.arch }}.tar
           if-no-files-found: error
           compression-level: 0
 
   appimage:
     needs: check
-    if: needs.check.outputs.build == 'true' || github.event_name == 'push'
+    if: needs.check.outputs.matrix != '[]'
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.check.outputs.matrix) }}
+    name: appimage (${{ matrix.channel }}, ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -104,17 +122,23 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y libarchive-tools zsync file
+          sudo apt-get install -y libarchive-tools zsync jq
 
       - name: Build
+        env:
+          CHANNEL: ${{ matrix.channel }}
+          ARCH: ${{ matrix.arch }}
+          URL: ${{ matrix.url }}
+          SHA256: ${{ matrix.sha256 }}
+          KIND: ${{ matrix.kind }}
+          VERSION: ${{ matrix.version }}
         run: |
           OUT_DIR=dist bash scripts/build-appimage.sh \
-            '${{ matrix.arch }}' '${{ matrix.url }}' '${{ matrix.sha256 }}' \
-            '${{ matrix.kind }}' '${{ needs.check.outputs.version }}' '${{ github.repository }}'
+            "$CHANNEL" "$ARCH" "$URL" "$SHA256" "$KIND" "$VERSION" "$GITHUB_REPOSITORY"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: appimage-${{ matrix.arch }}
+          name: appimage-${{ matrix.channel }}-${{ matrix.arch }}
           path: |
             dist/*.AppImage
             dist/*.zsync
@@ -123,18 +147,20 @@ jobs:
 
   release:
     needs: [check, flatpak, appimage]
-    if: needs.check.outputs.build == 'true'
+    if: needs.check.outputs.any_release == 'true'
     runs-on: ubuntu-24.04
     outputs:
-      signed: ${{ steps.flatpak.outputs.signed }}
+      deploy_pages: ${{ steps.flatpak.outputs.deploy_pages }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install flatpak and ostree
         run: |
           sudo apt-get update
-          sudo apt-get install -y flatpak ostree
+          sudo apt-get install -y flatpak ostree jq
 
+      # Only the channels being released. On a push, the others were built
+      # just as a test and are not published.
       - uses: actions/download-artifact@v4
         with:
           pattern: appimage-*
@@ -147,12 +173,24 @@ jobs:
           path: flatpak-repos
           merge-multiple: true
 
-      - name: Build the Flatpak repo and bundles
+      - name: Pages address
+        id: pages
+        env:
+          PAGES_URL: ${{ vars.PAGES_URL }}
+        run: |
+          # Set the PAGES_URL repo variable if you use a custom domain.
+          if [ -z "$PAGES_URL" ]; then
+            PAGES_URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
+          fi
+          echo "url=$PAGES_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Flatpak repo and bundles
         id: flatpak
         env:
           FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
-          PAGES_URL: ${{ vars.PAGES_URL }}
-          VERSION: ${{ needs.check.outputs.version }}
+          RELEASE_CHANNELS: ${{ needs.check.outputs.release_channels }}
+          VERSIONS: ${{ needs.check.outputs.versions }}
+          SITE_URL: ${{ steps.pages.outputs.url }}
         run: |
           if [ -n "$FLATPAK_GPG_PRIVATE_KEY" ]; then
             export GPG_HOMEDIR="$RUNNER_TEMP/gnupg"
@@ -163,55 +201,27 @@ jobs:
           else
             echo "::warning::FLATPAK_GPG_PRIVATE_KEY is not set, so there is no hosted Flatpak repo and the bundles will not update. See the README."
           fi
-          # Default Pages address. Set the PAGES_URL repo variable if you use a custom domain.
-          if [ -z "$PAGES_URL" ]; then
-            PAGES_URL="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
-          fi
-          echo "pages_url=$PAGES_URL" >> "$GITHUB_OUTPUT"
-          bash scripts/publish-flatpak-repo.sh "$VERSION" "$PAGES_URL" site dist flatpak-repos/*.tar >> "$GITHUB_OUTPUT"
+          bash scripts/publish-flatpak-repo.sh flatpak-repos/*.tar
 
-      - name: Checksums
-        working-directory: dist
-        run: sha256sum -- *.flatpak *.AppImage > SHA256SUMS && cat SHA256SUMS
-
-      - name: Publish release
+      - name: GitHub releases
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          VERSION: ${{ needs.check.outputs.version }}
-          UPSTREAM_TAG: ${{ needs.check.outputs.upstream_tag }}
-          SIGNED: ${{ steps.flatpak.outputs.signed }}
-          PAGES_URL: ${{ steps.flatpak.outputs.pages_url }}
-        run: |
-          tag="v$VERSION"
-          {
-            echo "Brave Origin $VERSION, repackaged from Brave's official Linux build on the [$UPSTREAM_TAG release](https://github.com/brave/brave-browser/releases/tag/$UPSTREAM_TAG)."
-            echo
-            echo "Changelog: [CHANGELOG_DESKTOP_ORIGIN.md](https://github.com/brave/brave-browser/blob/master/CHANGELOG_DESKTOP_ORIGIN.md)"
-            echo
-            if [ "$SIGNED" = true ]; then
-              echo "Install the Flatpak with updates: \`flatpak install --user ${PAGES_URL}brave-origin.flatpakref\`"
-            else
-              echo "Install the Flatpak: \`flatpak install --user ./brave-origin-$VERSION-x86_64.flatpak\` (or aarch64)."
-            fi
-            echo
-            echo "See the README for the AppImage."
-          } > notes.md
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
-            gh release edit "$tag" --notes-file notes.md --latest
-          else
-            gh release create "$tag" dist/* --title "Brave Origin $VERSION" --notes-file notes.md --latest
-          fi
+          RELEASE_CHANNELS: ${{ needs.check.outputs.release_channels }}
+          VERSIONS: ${{ needs.check.outputs.versions }}
+          UPSTREAM_TAGS: ${{ needs.check.outputs.upstream_tags }}
+          PAGES_URL: ${{ steps.pages.outputs.url }}
+          PAGES_DEPLOYED: ${{ steps.flatpak.outputs.deploy_pages }}
+        run: bash scripts/publish-releases.sh
 
       - uses: actions/upload-pages-artifact@v3
-        if: steps.flatpak.outputs.signed == 'true'
+        if: steps.flatpak.outputs.deploy_pages == 'true'
         with:
           path: site
 
   pages:
     needs: release
-    if: needs.release.outputs.signed == 'true'
+    if: needs.release.outputs.deploy_pages == 'true'
     runs-on: ubuntu-24.04
     permissions:
       pages: write
