@@ -1,0 +1,9 @@
+dist/
+build/
+repo/
+flatpak/
+flathub-brave/
+appimage-build/
+.flatpak-builder/
+release.json
+__pycache__/
