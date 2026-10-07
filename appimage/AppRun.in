@@ -1,0 +1,25 @@
+#!/bin/sh
+# Launcher for the @NAME@ AppImage. build-appimage.sh fills in the @ values.
+HERE=$(dirname "$(readlink -f "$0")")
+APP=$HERE/opt/@SLUG@
+
+# Brave reads this at startup to pick its channel, and with it the profile
+# dir (~/.config/@PROFILE_DIR@) and the desktop file name. Brave's own wrapper
+# script sets it the same way.
+export CHROME_VERSION_EXTRA=@CHANNEL@
+export GNOME_DISABLE_CRASH_DIALOG=SET_BY_GOOGLE_CHROME
+export LD_LIBRARY_PATH="$APP:$APP/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# Point relaunches and "create shortcut" at the AppImage file itself, since
+# the mount path changes every launch.
+if [ -n "$APPIMAGE" ]; then
+  export CHROME_WRAPPER="$APPIMAGE"
+fi
+
+# Some xdg-mime versions fail without this file, Brave's wrapper does the same.
+apps_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+if mkdir -p "$apps_dir" 2>/dev/null && [ ! -f "$apps_dir/mimeapps.list" ]; then
+  touch "$apps_dir/mimeapps.list" 2>/dev/null
+fi
+
+exec "$APP/brave" "$@"
